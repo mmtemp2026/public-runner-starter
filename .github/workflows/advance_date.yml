@@ -65,7 +65,7 @@ jobs:
           pip install -r requirements.txt
 
       - name: Set DATE_CODE
-        run: echo "DATE_CODE=20260904" >> "$GITHUB_ENV"
+        run: echo "DATE_CODE=20260925" >> "$GITHUB_ENV"
 
       - name: Trigger District shard on Railway
         shell: bash
