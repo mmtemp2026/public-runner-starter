@@ -22,7 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
-      PRIVATE_SCRAPER_REPO: ${{ vars.PRIVATE_SCRAPER_REPO }}
+      PRIVATE_SCRAPER_REPO: ${{ secrets.PRIVATE_SCRAPER_REPO }}
       PRIVATE_REPO_READ_TOKEN: ${{ secrets.PRIVATE_REPO_READ_TOKEN }}
       R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
       R2_ACCESS_KEY: ${{ secrets.R2_ACCESS_KEY }}
@@ -35,6 +35,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # The full owner/repo is masked already, because it comes from a
+          # secret. Mask the bare repository name too, so it stays hidden if
+          # it ever surfaces on its own - in an error message, say.
+          echo "::add-mask::${PRIVATE_SCRAPER_REPO##*/}"
           missing=0
           for key in PRIVATE_SCRAPER_REPO PRIVATE_REPO_READ_TOKEN R2_ACCOUNT_ID R2_ACCESS_KEY R2_SECRET_KEY; do
             if [ -z "${!key:-}" ]; then
@@ -46,7 +50,7 @@ jobs:
             exit 1
           fi
 
-      - name: Checkout private scraper repo
+      - name: Repo
         uses: actions/checkout@v4
         with:
           repository: ${{ env.PRIVATE_SCRAPER_REPO }}
@@ -69,6 +73,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      - name: Install Playwright Chromium
+        working-directory: private-src
+        run: python -m playwright install --with-deps chromium
 
       - name: Resolve DATE_CODE
         shell: bash
@@ -93,7 +101,7 @@ jobs:
           DATE_CODE="$(printf '%s' "${DATE_CODE}" | tr -d '\r\n' | xargs)"
           echo "DATE_CODE=$DATE_CODE" >> "$GITHUB_ENV"
 
-      - name: Trigger District shard on Railway
+      - name: Kick S9
         shell: bash
         env:
           RAILWAY_DISTRICT_URL: ${{ secrets.RAILWAY_DISTRICT_URL }}
@@ -101,15 +109,15 @@ jobs:
           DATE_CODE: ${{ env.DATE_CODE }}
         run: |
           set -uo pipefail
-          echo "Triggering District (advance) for $DATE_CODE ..."
-          code=$(curl -sS -o /tmp/district.json -w '%{http_code}' -X POST \
+          echo "Triggering remote shard for $DATE_CODE ..."
+          code=$(curl -sS -o /tmp/remote-shard.json -w '%{http_code}' -X POST \
             -H "X-Auth: $DISTRICT_TRIGGER_SECRET" --max-time 300 \
             "$RAILWAY_DISTRICT_URL/run-district?mode=advance&date=$DATE_CODE" || echo 000)
-          echo "District HTTP $code"; cat /tmp/district.json || true; echo
+          echo "Remote shard HTTP $code"
           if [ "$code" != "200" ]; then
-            echo "::warning::District trigger failed (HTTP $code) - combine will use last shard 9 in R2"
+            echo "::warning::Remote shard trigger failed (HTTP $code) - combine will use the last copy in R2"
           fi
-      - name: Run advance scrape
+      - name: Scrape
         working-directory: private-src
         env:
           SCRAPE_MODE: advance
@@ -119,7 +127,7 @@ jobs:
           R2_ACCESS_KEY: ${{ env.R2_ACCESS_KEY }}
           R2_SECRET_KEY: ${{ env.R2_SECRET_KEY }}
           R2_BUCKET_NAME: ${{ env.R2_BUCKET_NAME }}
-        run: python railway_runner.py
+        run: xvfb-run -a python railway_runner.py
 
       - name: Verify R2 upload
         working-directory: private-src
