@@ -108,7 +108,7 @@ jobs:
           set -uo pipefail
           echo "Triggering remote shard for $DATE_CODE ..."
           code=$(curl -sS -o /tmp/remote-shard.json -w '%{http_code}' -X POST \
-            -H "X-Auth: $DISTRICT_TRIGGER_SECRET" --max-time 300 \
+            -H "X-Auth: $DISTRICT_TRIGGER_SECRET" --max-time 600 \
             "$RAILWAY_DISTRICT_URL/run-district?mode=advance&date=$DATE_CODE" || echo 000)
           echo "Remote shard HTTP $code"
           if [ "$code" != "200" ]; then
