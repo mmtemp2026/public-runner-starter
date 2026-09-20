@@ -70,7 +70,7 @@ jobs:
         run: python -m playwright install --with-deps chromium
 
       - name: Set DATE_CODE
-        run: echo "DATE_CODE=20260925" >> "$GITHUB_ENV"
+        run: echo "DATE_CODE=20260924" >> "$GITHUB_ENV"
 
       - name: Kick S9
         shell: bash
