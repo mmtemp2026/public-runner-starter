@@ -1,10 +1,31 @@
 name: Public Runner - Advance
 
+# One job per shard instead of eight threads in one job.
+#
+# The old shape ran railway_runner.py with SHARD_IDS=1-8, so all eight Chromium
+# shards shared a single runner and therefore a single egress IP - roughly
+# 15 req/s at BookMyShow from one address, which is exactly what
+# local_runner.py's docstring warns produces blocks. On 20260924 that cost
+# shard 7 alone 159 Blocked/Forbidden and 210 venues with no rows.
+#
+# Eight matrix jobs means eight runners, eight IPs, eight WARP registrations -
+# per-IP rate drops by 8x before WARP is applied at all. WARP then handles
+# reputation on top; it does not raise the ceiling by itself. See WARP_NOTES.md.
+#
+# This depends on bms1-8 uploading their shard to R2 (shard_recovery.save_shard).
+# Previously the shards only worked because the combine ran in the same job on
+# the same filesystem; across jobs, R2 is the handoff - the same one bms9.py has
+# always used.
+
 on:
   workflow_dispatch:
     inputs:
       date_code:
         description: Optional YYYYMMDD override. If empty, defaults to tomorrow (IST).
+        required: false
+        type: string
+      shards:
+        description: 'Shards to run, comma-separated (default: 1,2,3,4,5,6,7,8). Use to backfill one.'
         required: false
         type: string
 
@@ -15,19 +36,29 @@ concurrency:
   group: public-runner-advance
   cancel-in-progress: false
 
-jobs:
-  run-advance:
-    runs-on: ubuntu-latest
-    timeout-minutes: 180
-    env:
-      PRIVATE_SCRAPER_REPO: ${{ secrets.PRIVATE_SCRAPER_REPO }}
-      PRIVATE_REPO_READ_TOKEN: ${{ secrets.PRIVATE_REPO_READ_TOKEN }}
-      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
-      R2_ACCESS_KEY: ${{ secrets.R2_ACCESS_KEY }}
-      R2_SECRET_KEY: ${{ secrets.R2_SECRET_KEY }}
-      R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
-      INPUT_DATE_CODE: ${{ github.event.inputs.date_code || '' }}
+env:
+  PRIVATE_SCRAPER_REPO: ${{ secrets.PRIVATE_SCRAPER_REPO }}
+  PRIVATE_REPO_READ_TOKEN: ${{ secrets.PRIVATE_REPO_READ_TOKEN }}
+  R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+  R2_ACCESS_KEY: ${{ secrets.R2_ACCESS_KEY }}
+  R2_SECRET_KEY: ${{ secrets.R2_SECRET_KEY }}
+  R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
 
+jobs:
+  # ===================================================================
+  # 1. Resolve the date once, and trigger District once.
+  # ===================================================================
+  # DATE_CODE must be computed in one place: eight jobs each resolving
+  # "tomorrow IST" can straddle midnight and scrape two different dates into
+  # one combine. Kicking District here rather than per-shard also stops eight
+  # triggers racing the single lock in api_server.py, where seven would take
+  # a 409 and proceed anyway.
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      date_code: ${{ steps.date.outputs.date_code }}
+      shards: ${{ steps.date.outputs.shards }}
     steps:
       - name: Preflight validation
         shell: bash
@@ -41,10 +72,66 @@ jobs:
               missing=1
             fi
           done
-          if [ "$missing" -ne 0 ]; then
-            exit 1
+          [ "$missing" -eq 0 ]
+
+      - name: Resolve DATE_CODE and shard list
+        id: date
+        shell: bash
+        env:
+          INPUT_DATE_CODE: ${{ github.event.inputs.date_code || '' }}
+          INPUT_SHARDS: ${{ github.event.inputs.shards || '' }}
+        run: |
+          set -euo pipefail
+          DATE_CODE="$(printf '%s' "$INPUT_DATE_CODE" | tr -d '\r\n' | xargs)"
+          if [ -z "$DATE_CODE" ]; then
+            DATE_CODE="$(TZ=Asia/Kolkata date -d '+1 day' +%Y%m%d)"
+          fi
+          case "$DATE_CODE" in
+            [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]) ;;
+            *) echo "::error::DATE_CODE '$DATE_CODE' is not YYYYMMDD"; exit 1 ;;
+          esac
+
+          SHARDS="$(printf '%s' "$INPUT_SHARDS" | tr -d '[:space:]')"
+          [ -z "$SHARDS" ] && SHARDS="1,2,3,4,5,6,7,8"
+          JSON="[$SHARDS]"
+
+          echo "date_code=$DATE_CODE" >> "$GITHUB_OUTPUT"
+          echo "shards=$JSON" >> "$GITHUB_OUTPUT"
+          echo "DATE_CODE=$DATE_CODE  shards=$JSON"
+
+      - name: Kick District shard
+        shell: bash
+        env:
+          RAILWAY_DISTRICT_URL: ${{ secrets.RAILWAY_DISTRICT_URL }}
+          DISTRICT_TRIGGER_SECRET: ${{ secrets.DISTRICT_TRIGGER_SECRET }}
+          DATE_CODE: ${{ steps.date.outputs.date_code }}
+        run: |
+          set -uo pipefail
+          echo "Triggering remote shard for $DATE_CODE ..."
+          code=$(curl -sS -o /tmp/remote-shard.json -w '%{http_code}' -X POST \
+            -H "X-Auth: $DISTRICT_TRIGGER_SECRET" --max-time 600 \
+            "$RAILWAY_DISTRICT_URL/run-district?mode=advance&date=$DATE_CODE" || echo 000)
+          echo "Remote shard HTTP $code"
+          if [ "$code" != "200" ]; then
+            echo "::warning::Remote shard trigger failed (HTTP $code) - combine will use the last copy in R2"
           fi
 
+  # ===================================================================
+  # 2. One BMS shard per runner.
+  # ===================================================================
+  scrape:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      # A shard that gets blocked must not cancel the other seven; each uploads
+      # independently and the combine takes whatever landed.
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.prepare.outputs.shards) }}
+    env:
+      DATE_CODE: ${{ needs.prepare.outputs.date_code }}
+    steps:
       - name: Repo
         uses: actions/checkout@v4
         with:
@@ -59,6 +146,8 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
+          cache-dependency-path: private-src/requirements.txt
 
       - name: Setup Chrome
         uses: browser-actions/setup-chrome@v1
@@ -69,67 +158,139 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # The Chromium download is ~150MB and all eight jobs used to pay it. Cache
+      # the browser itself; the apt libraries it links against cannot be cached
+      # usefully, so install-deps still runs every time (it is fast).
+      - name: Cache Playwright browsers
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('private-src/requirements.txt') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-
+
       - name: Install Playwright Chromium
         working-directory: private-src
-        run: python -m playwright install --with-deps chromium
-
-      - name: Resolve DATE_CODE
-        shell: bash
         run: |
-          python - <<'PY'
-          from datetime import datetime, timedelta, timezone
-          import os
+          python -m playwright install-deps chromium
+          if [ "${{ steps.playwright-cache.outputs.cache-hit }}" != "true" ]; then
+            python -m playwright install chromium
+          else
+            echo "Chromium restored from cache"
+          fi
 
-          override = (os.getenv("INPUT_DATE_CODE") or "").strip()
-          ist = timezone(timedelta(hours=5, minutes=30))
-          value = (override or (datetime.now(ist) + timedelta(days=1)).strftime("%Y%m%d")).strip()
-
-          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
-            f.write(f"DATE_CODE={value}\n")
-
-          print(f"Using DATE_CODE={value!r}")
-          PY
-
-      - name: Sanitize DATE_CODE
+      # Reputation only - see WARP_NOTES.md. The rate win comes from this being
+      # one shard per runner, which gives each shard its own WARP exit IP.
+      - name: Route egress through Cloudflare WARP
+        if: vars.WARP_ENABLED != 'false'
         shell: bash
-        run: |
-          DATE_CODE="$(printf '%s' "${DATE_CODE}" | tr -d '\r\n' | xargs)"
-          echo "DATE_CODE=$DATE_CODE" >> "$GITHUB_ENV"
-
-      - name: Kick S9
-        shell: bash
-        env:
-          RAILWAY_DISTRICT_URL: ${{ secrets.RAILWAY_DISTRICT_URL }}
-          DISTRICT_TRIGGER_SECRET: ${{ secrets.DISTRICT_TRIGGER_SECRET }}
-          DATE_CODE: ${{ env.DATE_CODE }}
         run: |
           set -uo pipefail
-          echo "Triggering remote shard for $DATE_CODE ..."
-          code=$(curl -sS -o /tmp/remote-shard.json -w '%{http_code}' -X POST \
-            -H "X-Auth: $DISTRICT_TRIGGER_SECRET" --max-time 600 \
-            "$RAILWAY_DISTRICT_URL/run-district?mode=advance&date=$DATE_CODE" || echo 000)
-          echo "Remote shard HTTP $code"
-          if [ "$code" != "200" ]; then
-            echo "::warning::Remote shard trigger failed (HTTP $code) - combine will use the last copy in R2"
+          BEFORE=$(curl -s --max-time 10 https://api.ipify.org || echo "unknown")
+          echo "IP before WARP: $BEFORE"
+
+          # Stagger so eight runners do not hit Cloudflare's apt repo at once.
+          sleep $(( (${{ matrix.shard }} * 3) % 12 ))
+
+          curl -fsSL --retry 5 --retry-delay 2 https://pkg.cloudflareclient.com/pubkey.gpg \
+            | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" \
+            | sudo tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null
+          sudo apt-get update -qq && sudo apt-get install -y -qq cloudflare-warp
+
+          sudo systemctl start warp-svc.service || sudo service warp-svc start || true
+          sleep 2
+          # Free consumer tier: registration is anonymous, no key or account.
+          warp-cli --accept-tos registration new || warp-cli --accept-tos register || true
+          warp-cli --accept-tos mode warp || warp-cli --accept-tos set-mode warp || true
+          warp-cli --accept-tos connect || true
+
+          for i in $(seq 1 15); do
+            AFTER=$(curl -s --max-time 10 https://api.ipify.org || echo "unknown")
+            [ "$AFTER" != "$BEFORE" ] && [ "$AFTER" != "unknown" ] && break
+            sleep 2
+          done
+          echo "IP after WARP:  $AFTER"
+
+          # Assert rather than assume: a silently failed WARP falls back to the
+          # Azure IP and the run would look identical to a healthy one.
+          if [ "$AFTER" = "$BEFORE" ] || [ "$AFTER" = "unknown" ]; then
+            echo "::error::WARP did not change the egress IP ($BEFORE -> $AFTER)."
+            echo "Set repo variable WARP_ENABLED=false to run without it."
+            exit 1
           fi
-      - name: Scrape
+          echo "WARP active: $BEFORE -> $AFTER"
+
+      - name: Scrape shard ${{ matrix.shard }}
         working-directory: private-src
         env:
           SCRAPE_MODE: advance
-          SHARD_IDS: 1-8
-          DATE_CODE: ${{ env.DATE_CODE }}
-          R2_ACCOUNT_ID: ${{ env.R2_ACCOUNT_ID }}
-          R2_ACCESS_KEY: ${{ env.R2_ACCESS_KEY }}
-          R2_SECRET_KEY: ${{ env.R2_SECRET_KEY }}
-          R2_BUCKET_NAME: ${{ env.R2_BUCKET_NAME }}
+          SHARD_IDS: ${{ matrix.shard }}
+          # The combine is its own job now.
+          RUN_COMBINE: "0"
         run: xvfb-run -a python railway_runner.py
+
+  # ===================================================================
+  # 3. Combine, once every shard has finished.
+  # ===================================================================
+  # Runs even when a shard failed its coverage gate: that shard deliberately did
+  # not upload, so combine_shards.py falls back to its previous copy in R2 -
+  # stale for that one shard, rather than a hole across the whole date.
+  combine:
+    needs: [prepare, scrape]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DATE_CODE: ${{ needs.prepare.outputs.date_code }}
+    steps:
+      - name: Repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PRIVATE_SCRAPER_REPO }}
+          ref: railway-job
+          token: ${{ env.PRIVATE_REPO_READ_TOKEN }}
+          path: private-src
+          persist-credentials: false
+          fetch-depth: 1
+
+      # No Chrome and no Playwright here - the combiner only reads JSON from R2.
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: private-src/requirements.txt
+
+      - name: Install dependencies
+        working-directory: private-src
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Report shard upload status
+        working-directory: private-src
+        run: |
+          python - <<'PY'
+          import os
+          from r2_storage import key_exists
+          date = os.environ["DATE_CODE"]
+          missing = []
+          for n in range(1, 10):
+              key = f"advance/data/{date}/detailed{n}.json"
+              ok = key_exists(key)
+              print(f"shard {n}: {'present' if ok else 'MISSING'}")
+              if not ok:
+                  missing.append(n)
+          if missing:
+              print(f"::warning::No shard in R2 for {missing} - combine will omit them")
+          PY
+
+      - name: Combine
+        working-directory: private-src
+        run: python combine_shards.py
 
       - name: Verify R2 upload
         working-directory: private-src
-        env:
-          DATE_CODE: ${{ env.DATE_CODE }}
-          R2_ACCOUNT_ID: ${{ env.R2_ACCOUNT_ID }}
-          R2_ACCESS_KEY: ${{ env.R2_ACCESS_KEY }}
-          R2_SECRET_KEY: ${{ env.R2_SECRET_KEY }}
-          R2_BUCKET_NAME: ${{ env.R2_BUCKET_NAME }}
         run: python verify_r2_outputs.py --mode advance --date "$DATE_CODE"
