@@ -50,9 +50,11 @@ jobs:
   # ===================================================================
   # DATE_CODE must be computed in one place: eight jobs each resolving
   # "tomorrow IST" can straddle midnight and scrape two different dates into
-  # one combine. Kicking District here rather than per-shard also stops eight
-  # triggers racing the single lock in api_server.py, where seven would take
-  # a 409 and proceed anyway.
+  # one combine.
+  #
+  # This job does nothing but resolve it, so the shards start within seconds.
+  # The District kick lives in its own job below - it used to sit here, where
+  # its 117s of waiting delayed all eight shards for no reason.
   prepare:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -99,12 +101,28 @@ jobs:
           echo "shards=$JSON" >> "$GITHUB_OUTPUT"
           echo "DATE_CODE=$DATE_CODE  shards=$JSON"
 
+  # ===================================================================
+  # 2. District, in parallel with the BMS shards.
+  # ===================================================================
+  # Its own job on purpose. The request blocks for as long as the District
+  # scrape takes (117s here, ~308s for a full-venue date), and the BMS shards
+  # have no dependency on it - only the combine does. Running it alongside them
+  # takes that wait off the critical path entirely, since the slowest BMS shard
+  # outlasts it either way.
+  #
+  # Still exactly one trigger per run: eight per-shard kicks would race the
+  # single lock in api_server.py and seven would take a 409.
+  kick-district:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
       - name: Kick District shard
         shell: bash
         env:
           RAILWAY_DISTRICT_URL: ${{ secrets.RAILWAY_DISTRICT_URL }}
           DISTRICT_TRIGGER_SECRET: ${{ secrets.DISTRICT_TRIGGER_SECRET }}
-          DATE_CODE: ${{ steps.date.outputs.date_code }}
+          DATE_CODE: ${{ needs.prepare.outputs.date_code }}
         run: |
           set -uo pipefail
           echo "Triggering remote shard for $DATE_CODE ..."
@@ -117,7 +135,7 @@ jobs:
           fi
 
   # ===================================================================
-  # 2. One BMS shard per runner.
+  # 3. One BMS shard per runner.
   # ===================================================================
   scrape:
     needs: prepare
@@ -232,13 +250,14 @@ jobs:
         run: xvfb-run -a python railway_runner.py
 
   # ===================================================================
-  # 3. Combine, once every shard has finished.
+  # 4. Combine, once every shard has finished.
   # ===================================================================
-  # Runs even when a shard failed its coverage gate: that shard deliberately did
-  # not upload, so combine_shards.py falls back to its previous copy in R2 -
-  # stale for that one shard, rather than a hole across the whole date.
+  # Runs even when a shard failed its coverage gate, or the District kick came
+  # back non-200: that shard deliberately did not upload, so combine_shards.py
+  # falls back to its previous copy in R2 - stale for one shard, rather than a
+  # hole across the whole date.
   combine:
-    needs: [prepare, scrape]
+    needs: [prepare, kick-district, scrape]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
