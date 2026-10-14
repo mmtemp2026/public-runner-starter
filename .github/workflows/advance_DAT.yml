@@ -179,24 +179,21 @@ jobs:
       # The Chromium download is ~150MB and all eight jobs used to pay it. Cache
       # the browser itself; the apt libraries it links against cannot be cached
       # usefully, so install-deps still runs every time (it is fast).
+      - name: Resolve Playwright version
+        id: playwright-version
+        run: echo "version=$(python -c 'import importlib.metadata as m; print(m.version("playwright"))')" >> "$GITHUB_OUTPUT"
+
       - name: Cache Playwright browsers
-        id: playwright-cache
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ hashFiles('private-src/requirements.txt') }}
-          restore-keys: |
-            playwright-${{ runner.os }}-
+          key: playwright-${{ runner.os }}-${{ steps.playwright-version.outputs.version }}
 
       - name: Install Playwright Chromium
         working-directory: private-src
         run: |
           python -m playwright install-deps chromium
-          if [ "${{ steps.playwright-cache.outputs.cache-hit }}" != "true" ]; then
-            python -m playwright install chromium
-          else
-            echo "Chromium restored from cache"
-          fi
+          python -m playwright install chromium
 
       # Reputation only - see WARP_NOTES.md. The rate win comes from this being
       # one shard per runner, which gives each shard its own WARP exit IP.
